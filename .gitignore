@@ -4,3 +4,4 @@ target/
 .idea/
 .vs/
 output/
+electron/node_modules

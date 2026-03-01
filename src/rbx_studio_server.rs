@@ -1,10 +1,12 @@
 use crate::error::{Report, Result};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::{extract::State, Json};
 use color_eyre::eyre::{eyre, Error, OptionExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -13,8 +15,7 @@ use uuid::Uuid;
 
 pub const STUDIO_PLUGIN_PORT: u16 = 44755;
 const LONG_POLL_DURATION: Duration = Duration::from_secs(15);
-const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_MODEL: &str = "gemini-2.5-flash";
+const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1alpha/models";
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ToolArguments {
@@ -34,9 +35,37 @@ pub struct AppState {
     pub output_map: HashMap<Uuid, mpsc::UnboundedSender<Result<String>>>,
     pub waiter: watch::Receiver<()>,
     pub trigger: watch::Sender<()>,
+    pub api_key: Option<String>,
+    pub conversation_history: Vec<GeminiContent>,
+    pub chat_streams: HashMap<String, mpsc::Sender<SsePayload>>,
+    pub chat_receivers: HashMap<String, mpsc::Receiver<SsePayload>>,
 }
 
 pub type PackedState = Arc<Mutex<AppState>>;
+
+#[derive(Debug, Clone)]
+pub enum SsePayload {
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+        call_index: usize,
+    },
+    ToolResult {
+        name: String,
+        result: String,
+        call_index: usize,
+    },
+    Text {
+        content: String,
+    },
+    Thought {
+        content: String,
+    },
+    Done,
+    Error {
+        error: String,
+    },
+}
 
 impl AppState {
     pub fn new() -> Self {
@@ -46,6 +75,10 @@ impl AppState {
             output_map: HashMap::new(),
             waiter,
             trigger,
+            api_key: None,
+            conversation_history: Vec::new(),
+            chat_streams: HashMap::new(),
+            chat_receivers: HashMap::new(),
         }
     }
 }
@@ -112,6 +145,26 @@ pub struct GeminiRequest {
     pub tools: Option<Vec<ToolDeclaration>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_instruction: Option<GeminiContent>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
+    pub generation_config: Option<GenerationConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_thoughts: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -127,9 +180,22 @@ pub struct GeminiPart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+    pub thought_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<InlineData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_response: Option<GeminiFunctionResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineData {
+    pub mime_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -146,8 +212,12 @@ pub struct GeminiFunctionResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolDeclaration {
-    #[serde(rename = "functionDeclarations")]
-    pub function_declarations: Vec<FunctionDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "functionDeclarations")]
+    pub function_declarations: Option<Vec<FunctionDeclaration>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "googleSearch")]
+    pub google_search: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "codeExecution")]
+    pub code_execution: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -177,7 +247,7 @@ pub struct GeminiCandidate {
 
 pub fn build_tool_declarations() -> Vec<ToolDeclaration> {
     vec![ToolDeclaration {
-        function_declarations: vec![
+        function_declarations: Some(vec![
             FunctionDeclaration {
                 name: "run_code".to_string(),
                 description: "Runs a command in Roblox Studio and returns the printed output. Can be used to both make changes and retrieve information.".to_string(),
@@ -260,21 +330,30 @@ pub fn build_tool_declarations() -> Vec<ToolDeclaration> {
                     "properties": {}
                 })),
             },
-        ],
+        ]),
+        google_search: None,
+        code_execution: None,
     }]
 }
 
-pub fn build_system_instruction() -> GeminiContent {
+pub fn build_system_instruction(custom_prompt: Option<String>) -> GeminiContent {
+    let mut text = "You are a Roblox Studio assistant. You must be aware of the current studio mode before using any tools. Infer the mode from conversation context or use get_studio_mode.\n\
+        Use run_code to query data from Roblox Studio place or to change it.\n\
+        After calling run_script_in_play_mode, the datamodel status will be reset to stop mode.\n\
+        Prefer using start_stop_play tool instead of run_script_in_play_mode. Only use run_script_in_play_mode to run one time unit test code on server datamodel.".to_string();
+
+    if let Some(custom) = custom_prompt {
+        text.push_str("\n\n");
+        text.push_str(&custom);
+    }
+
     GeminiContent {
         role: None,
         parts: vec![GeminiPart {
-            text: Some(
-                "You are a Roblox Studio assistant. You must be aware of the current studio mode before using any tools. Infer the mode from conversation context or use get_studio_mode.\n\
-                Use run_code to query data from Roblox Studio place or to change it.\n\
-                After calling run_script_in_play_mode, the datamodel status will be reset to stop mode.\n\
-                Prefer using start_stop_play tool instead of run_script_in_play_mode. Only use run_script_in_play_mode to run one time unit test code on server datamodel."
-                    .to_string(),
-            ),
+            text: Some(text),
+            thought: None,
+            thought_signature: None,
+            inline_data: None,
             function_call: None,
             function_response: None,
         }],
@@ -284,19 +363,22 @@ pub fn build_system_instruction() -> GeminiContent {
 pub async fn send_to_gemini(
     client: &reqwest::Client,
     api_key: &str,
+    model: &str,
     contents: &[GeminiContent],
     tools: &[ToolDeclaration],
     system_instruction: &GeminiContent,
+    generation_config: Option<GenerationConfig>,
 ) -> color_eyre::Result<GeminiResponse> {
     let url = format!(
         "{}/{}:generateContent?key={}",
-        GEMINI_API_BASE, GEMINI_MODEL, api_key
+        GEMINI_API_BASE, model, api_key
     );
 
     let request_body = GeminiRequest {
         contents: contents.to_vec(),
         tools: Some(tools.to_vec()),
         system_instruction: Some(system_instruction.clone()),
+        generation_config,
     };
 
     let response = client
@@ -421,160 +503,415 @@ pub async fn dispatch_function_call(
     }
 }
 
-pub async fn run_chat_loop(
-    state: PackedState,
-    api_key: String,
-) -> color_eyre::Result<()> {
-    let client = reqwest::Client::new();
-    let tools = build_tool_declarations();
-    let system_instruction = build_system_instruction();
-    let mut conversation_history: Vec<GeminiContent> = Vec::new();
+#[derive(Deserialize)]
+pub struct ChatSendRequest {
+    pub message: String,
+    pub image_base64: Option<String>,
+    pub image_mime_type: Option<String>,
+    pub model: Option<String>,
+    pub system_instruction: Option<String>,
+    pub temperature: Option<f32>,
+    pub thinking_level: Option<String>,
+    pub enable_google_search: Option<bool>,
+    pub enable_code_execution: Option<bool>,
+}
 
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
+#[derive(Serialize)]
+pub struct ChatSendResponse {
+    pub chat_id: String,
+}
 
-    println!("Roblox Studio Gemini Agent is ready.");
-    println!("Type your message and press Enter. Type 'exit' to quit.\n");
+pub async fn chat_send_handler(
+    State(state): State<PackedState>,
+    Json(payload): Json<ChatSendRequest>,
+) -> Result<impl IntoResponse> {
+    let chat_id = Uuid::new_v4().to_string();
+    let (sse_tx, sse_rx) = mpsc::channel::<SsePayload>(100);
 
-    loop {
-        use tokio::io::AsyncBufReadExt;
+    {
+        let mut app_state = state.lock().await;
+        app_state.chat_streams.insert(chat_id.clone(), sse_tx.clone());
+        app_state.chat_receivers.insert(chat_id.clone(), sse_rx);
 
-        print!("You: ");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
+        let mut parts = Vec::new();
 
-        let mut input = String::new();
-        let bytes_read = reader.read_line(&mut input).await?;
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        let input = input.trim().to_string();
-
-        if input.is_empty() {
-            continue;
-        }
-
-        if input.eq_ignore_ascii_case("exit") {
-            println!("Goodbye!");
-            break;
-        }
-
-        conversation_history.push(GeminiContent {
-            role: Some("user".to_string()),
-            parts: vec![GeminiPart {
-                text: Some(input),
+        if let (Some(base64), Some(mime)) = (&payload.image_base64, &payload.image_mime_type) {
+            parts.push(GeminiPart {
+                text: None,
+                thought: None,
+                thought_signature: None,
+                inline_data: Some(InlineData {
+                    mime_type: mime.clone(),
+                    data: base64.clone(),
+                }),
                 function_call: None,
                 function_response: None,
-            }],
+            });
+        }
+
+        parts.push(GeminiPart {
+            text: Some(payload.message.clone()),
+            thought: None,
+            thought_signature: None,
+            inline_data: None,
+            function_call: None,
+            function_response: None,
         });
 
-        loop {
-            let response = send_to_gemini(
-                &client,
-                &api_key,
-                &conversation_history,
-                &tools,
-                &system_instruction,
-            )
-            .await;
+        app_state.conversation_history.push(GeminiContent {
+            role: Some("user".to_string()),
+            parts,
+        });
+    }
 
-            match response {
-                Err(e) => {
-                    eprintln!("Gemini API error: {}", e);
-                    break;
-                }
-                Ok(gemini_response) => {
-                    let candidate = gemini_response
-                        .candidates
-                        .as_ref()
-                        .and_then(|c| c.first())
-                        .and_then(|c| c.content.as_ref());
+    let state_clone = Arc::clone(&state);
+    let chat_id_clone = chat_id.clone();
+    
+    // Unpack request paramters right before processing
+    let opts = payload;
 
-                    let parts = match candidate {
-                        Some(content) => content.parts.clone(),
-                        None => {
-                            eprintln!("No response content from Gemini.");
-                            break;
-                        }
-                    };
+    tokio::spawn(async move {
+        process_chat(state_clone, sse_tx, chat_id_clone, opts).await;
+    });
 
-                    let mut has_function_calls = false;
-                    let mut function_calls: Vec<GeminiFunctionCall> = Vec::new();
-                    let mut text_parts: Vec<String> = Vec::new();
+    Ok(Json(ChatSendResponse { chat_id }))
+}
 
-                    for part in &parts {
-                        if let Some(ref fc) = part.function_call {
-                            has_function_calls = true;
-                            function_calls.push(fc.clone());
-                        }
-                        if let Some(ref text) = part.text {
-                            if !text.is_empty() {
+async fn process_chat(
+    state: PackedState,
+    sse_tx: mpsc::Sender<SsePayload>,
+    chat_id: String,
+    opts: ChatSendRequest,
+) {
+    let client = reqwest::Client::new();
+    
+    let mut target_model = opts.model.unwrap_or_else(|| "gemini-2.5-flash".to_string());
+    if target_model == "gemini-3.1-pro-preview" {
+        target_model = "gemini-3.1-pro-preview-customtools".to_string();
+    }
+    
+    // Gemini 3.1 Pro Preview does not yet support mixing Function Calling with built-in tools like Google Search
+    let is_gemini_3 = target_model.starts_with("gemini-3.1");
+
+    let mut tools = build_tool_declarations();
+    if !is_gemini_3 && opts.enable_google_search.unwrap_or(false) {
+        tools.push(ToolDeclaration {
+            function_declarations: None,
+            google_search: Some(serde_json::json!({})),
+            code_execution: None,
+        });
+    }
+    if !is_gemini_3 && opts.enable_code_execution.unwrap_or(false) {
+        tools.push(ToolDeclaration {
+            function_declarations: None,
+            google_search: None,
+            code_execution: Some(serde_json::json!({})),
+        });
+    }
+    
+    let system_instruction = build_system_instruction(opts.system_instruction);
+    
+    let mut generation_config = GenerationConfig::default();
+    let mut has_gen_config = false;
+    
+    if let Some(t) = opts.temperature {
+        generation_config.temperature = Some(t);
+        has_gen_config = true;
+    }
+    if is_gemini_3 {
+        let mut t_config = ThinkingConfig {
+            thinking_level: None,
+            include_thoughts: Some(true),
+        };
+        if let Some(level) = opts.thinking_level {
+            if level != "none" {
+                t_config.thinking_level = Some(level);
+            }
+        }
+        generation_config.thinking_config = Some(t_config);
+        has_gen_config = true;
+    } else if let Some(level) = opts.thinking_level {
+        if level != "none" {
+            generation_config.thinking_config = Some(ThinkingConfig {
+                thinking_level: Some(level),
+                include_thoughts: Some(true),
+            });
+            has_gen_config = true;
+        }
+    }
+    let gen_config = if has_gen_config { Some(generation_config) } else { None };
+
+    let api_key = {
+        let app_state = state.lock().await;
+        app_state.api_key.clone()
+    };
+
+    let api_key = match api_key {
+        Some(key) => key,
+        None => {
+            let _ = sse_tx.send(SsePayload::Error {
+                error: "API key not set. Please configure it in settings.".to_string(),
+            }).await;
+            let _ = sse_tx.send(SsePayload::Done).await;
+            return;
+        }
+    };
+
+    loop {
+        let history = {
+            state.lock().await.conversation_history.clone()
+        };
+
+        let response = send_to_gemini(
+            &client,
+            &api_key,
+            &target_model,
+            &history,
+            &tools,
+            &system_instruction,
+            gen_config.clone(),
+        )
+        .await;
+
+        match response {
+            Err(e) => {
+                let _ = sse_tx.send(SsePayload::Error {
+                    error: format!("{}", e),
+                }).await;
+                let _ = sse_tx.send(SsePayload::Done).await;
+                break;
+            }
+            Ok(gemini_response) => {
+                let candidate = gemini_response
+                    .candidates
+                    .as_ref()
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.content.as_ref());
+
+                let parts = match candidate {
+                    Some(content) => content.parts.clone(),
+                    None => {
+                        let _ = sse_tx.send(SsePayload::Error {
+                            error: "No response from Gemini.".to_string(),
+                        }).await;
+                        let _ = sse_tx.send(SsePayload::Done).await;
+                        break;
+                    }
+                };
+
+                let mut has_function_calls = false;
+                let mut function_calls: Vec<GeminiFunctionCall> = Vec::new();
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut thought_parts: Vec<String> = Vec::new();
+
+                for part in &parts {
+                    if let Some(ref fc) = part.function_call {
+                        has_function_calls = true;
+                        function_calls.push(fc.clone());
+                    }
+                    if let Some(ref text) = part.text {
+                        if !text.is_empty() {
+                            if part.thought == Some(true) {
+                                thought_parts.push(text.clone());
+                            } else {
                                 text_parts.push(text.clone());
                             }
                         }
                     }
+                }
 
-                    conversation_history.push(GeminiContent {
+                {
+                    let mut app_state = state.lock().await;
+                    app_state.conversation_history.push(GeminiContent {
                         role: Some("model".to_string()),
                         parts: parts.clone(),
                     });
+                }
 
-                    if has_function_calls {
-                        let mut function_response_parts: Vec<GeminiPart> = Vec::new();
+                if has_function_calls {
+                    let mut function_response_parts: Vec<GeminiPart> = Vec::new();
 
-                        for fc in &function_calls {
-                            println!("  [Tool Call] {}({})", fc.name, fc.args);
+                    for (idx, fc) in function_calls.iter().enumerate() {
+                        let _ = sse_tx.send(SsePayload::ToolCall {
+                            name: fc.name.clone(),
+                            args: fc.args.clone(),
+                            call_index: idx,
+                        }).await;
 
-                            let result = dispatch_function_call(&state, fc).await;
+                        let result = dispatch_function_call(&state, fc).await;
 
-                            let result_str = match result {
-                                Ok(r) => r,
-                                Err(e) => format!("Error dispatching tool: {}", e),
-                            };
+                        let result_str = match result {
+                            Ok(r) => r,
+                            Err(e) => format!("Error dispatching tool: {}", e),
+                        };
 
-                            println!("  [Tool Result] {}", truncate_for_display(&result_str, 200));
+                        let _ = sse_tx.send(SsePayload::ToolResult {
+                            name: fc.name.clone(),
+                            result: result_str.clone(),
+                            call_index: idx,
+                        }).await;
 
-                            function_response_parts.push(GeminiPart {
-                                text: None,
-                                function_call: None,
-                                function_response: Some(GeminiFunctionResponse {
-                                    name: fc.name.clone(),
-                                    response: serde_json::json!({
-                                        "result": result_str
-                                    }),
+                        function_response_parts.push(GeminiPart {
+                            text: None,
+                            thought: None,
+                            thought_signature: None,
+                            inline_data: None,
+                            function_call: None,
+                            function_response: Some(GeminiFunctionResponse {
+                                name: fc.name.clone(),
+                                response: serde_json::json!({
+                                    "result": result_str
                                 }),
-                            });
-                        }
+                            }),
+                        });
+                    }
 
-                        conversation_history.push(GeminiContent {
+                    {
+                        let mut app_state = state.lock().await;
+                        app_state.conversation_history.push(GeminiContent {
                             role: Some("user".to_string()),
                             parts: function_response_parts,
                         });
-
-                        continue;
                     }
 
-                    if !text_parts.is_empty() {
-                        println!("\nGemini: {}\n", text_parts.join(""));
-                    }
-
-                    break;
+                    continue;
                 }
+
+                if !thought_parts.is_empty() {
+                    let _ = sse_tx.send(SsePayload::Thought {
+                        content: thought_parts.join(""),
+                    }).await;
+                }
+
+                if !text_parts.is_empty() {
+                    let _ = sse_tx.send(SsePayload::Text {
+                        content: text_parts.join(""),
+                    }).await;
+                }
+
+                let _ = sse_tx.send(SsePayload::Done).await;
+                break;
             }
         }
     }
 
-    Ok(())
+    {
+        let mut app_state = state.lock().await;
+        app_state.chat_streams.remove(&chat_id);
+    }
 }
 
-fn truncate_for_display(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
-    }
+pub async fn chat_events_handler(
+    State(state): State<PackedState>,
+    axum::extract::Path(chat_id): axum::extract::Path<String>,
+) -> Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>> {
+    let (real_tx, real_rx) = mpsc::channel::<std::result::Result<Event, Infallible>>(100);
+
+    let state_clone = Arc::clone(&state);
+    let chat_id_clone = chat_id.clone();
+    
+    // We get the receiver from the state, if it exists
+    let mut payload_rx = {
+        let mut app_state = state.lock().await;
+        app_state.chat_receivers.remove(&chat_id)
+    };
+
+    tokio::spawn(async move {
+        // If the chat somehow didn't exist, just close the SSE
+        let mut payload_rx = match payload_rx {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        // Loop until dropped or Done/Error received
+        while let Some(payload) = payload_rx.recv().await {
+            let event = match payload {
+                SsePayload::ToolCall { name, args, call_index } => {
+                    Event::default()
+                        .event("tool_call")
+                        .data(serde_json::json!({
+                            "name": name,
+                            "args": args,
+                            "call_index": call_index,
+                        }).to_string())
+                }
+                SsePayload::ToolResult { name, result, call_index } => {
+                    Event::default()
+                        .event("tool_result")
+                        .data(serde_json::json!({
+                            "name": name,
+                            "result": result,
+                            "call_index": call_index,
+                        }).to_string())
+                }
+                SsePayload::Text { content } => {
+                    Event::default()
+                        .event("text")
+                        .data(serde_json::json!({
+                            "content": content,
+                        }).to_string())
+                }
+                SsePayload::Thought { content } => {
+                    Event::default()
+                        .event("thinking")
+                        .data(serde_json::json!({
+                            "content": content,
+                        }).to_string())
+                }
+                SsePayload::Done => {
+                    let _ = real_tx.send(Ok(Event::default().event("done").data("{}"))).await;
+                    break;
+                }
+                SsePayload::Error { error } => {
+                    Event::default()
+                        .event("error_msg")
+                        .data(serde_json::json!({
+                            "error": error,
+                        }).to_string())
+                }
+            };
+            
+            if real_tx.send(Ok(event)).await.is_err() {
+                break;
+            }
+        }
+        
+        // Remove from state on disconnect or completion
+        {
+            let mut app_state = state_clone.lock().await;
+            app_state.chat_streams.remove(&chat_id_clone);
+        }
+    });
+
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(real_rx)).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+pub struct ApiKeyRequest {
+    pub api_key: String,
+}
+
+pub async fn api_key_handler(
+    State(state): State<PackedState>,
+    Json(payload): Json<ApiKeyRequest>,
+) -> Result<impl IntoResponse> {
+    let mut app_state = state.lock().await;
+    app_state.api_key = Some(payload.api_key);
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Serialize)]
+pub struct StatusResponse {
+    pub api_key_set: bool,
+}
+
+pub async fn status_handler(
+    State(state): State<PackedState>,
+) -> Result<impl IntoResponse> {
+    let app_state = state.lock().await;
+    Ok(Json(StatusResponse {
+        api_key_set: app_state.api_key.is_some(),
+    }))
 }
 
 pub async fn request_handler(State(state): State<PackedState>) -> Result<impl IntoResponse> {
